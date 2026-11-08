@@ -347,7 +347,9 @@ async fn invite(
         reporter.report(Event::Connecting {
             label: label.clone(),
         });
+        debug!(peer = label, "starting connectivity checks from the friend's reply");
         peer.accept_answer(answer).await?;
+        debug!(peer = label, timeout = ?CONNECT_TIMEOUT, "ICE checks started; waiting for the peer connection");
         peer.wait_connected(CONNECT_TIMEOUT).await?;
         let route = peer.log_selected_pair(&label).await;
         Ok::<_, anyhow::Error>(Some(Some((control, route))))

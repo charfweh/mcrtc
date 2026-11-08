@@ -218,6 +218,14 @@ impl Peer {
     /// Applies a remote offer and returns the answer SDP once gathering finished.
     pub async fn accept_offer(&self, sdp: String) -> Result<String> {
         let offer = RTCSessionDescription::offer(sdp).context("the invite has an invalid SDP")?;
+        let candidates = CandidateCounts::from_sdp(&offer.sdp);
+        debug!(
+            host = candidates.host,
+            srflx = candidates.srflx,
+            relay = candidates.relay,
+            other = candidates.other,
+            "applying remote offer"
+        );
         self.pc
             .set_remote_description(offer)
             .await
@@ -236,13 +244,24 @@ impl Peer {
 
     pub async fn accept_answer(&self, sdp: String) -> Result<()> {
         let answer = RTCSessionDescription::answer(sdp).context("the reply has an invalid SDP")?;
+        let candidates = CandidateCounts::from_sdp(&answer.sdp);
+        debug!(
+            host = candidates.host,
+            srflx = candidates.srflx,
+            relay = candidates.relay,
+            other = candidates.other,
+            "applying remote answer and starting ICE checks"
+        );
         self.pc
             .set_remote_description(answer)
             .await
-            .context("could not apply the reply")
+            .context("could not apply the reply")?;
+        debug!("remote answer applied; ICE connectivity checks are running");
+        Ok(())
     }
 
     async fn gathered_sdp(&self) -> Result<String> {
+        let started = tokio::time::Instant::now();
         let mut gathered = self.gathered.clone();
         if timeout(GATHER_TIMEOUT, gathered.wait_for(|done| *done))
             .await
@@ -255,12 +274,23 @@ impl Peer {
             .local_description()
             .await
             .ok_or_else(|| anyhow!("no local description after gathering"))?;
-        debug!(sdp = %description.sdp, "local SDP");
-        Ok(trim_candidates(&description.sdp))
+        let sdp = trim_candidates(&description.sdp);
+        let candidates = CandidateCounts::from_sdp(&sdp);
+        debug!(
+            elapsed = ?started.elapsed(),
+            host = candidates.host,
+            srflx = candidates.srflx,
+            relay = candidates.relay,
+            other = candidates.other,
+            "local ICE candidate gathering finished"
+        );
+        Ok(sdp)
     }
 
     /// Waits for the connection to come up, reporting failure with a NAT hint.
     pub async fn wait_connected(&self, limit: Duration) -> Result<()> {
+        let started = tokio::time::Instant::now();
+        debug!(?limit, "waiting for ICE, DTLS, and data-channel connection");
         let mut state = self.state.clone();
         let reached = timeout(
             limit,
@@ -275,11 +305,32 @@ impl Peer {
         )
         .await;
         match reached {
-            Ok(Ok(state)) if *state == RTCPeerConnectionState::Connected => Ok(()),
+            Ok(Ok(state)) if *state == RTCPeerConnectionState::Connected => {
+                debug!(elapsed = ?started.elapsed(), "peer connection established");
+                Ok(())
+            }
             Ok(Ok(state)) if *state == RTCPeerConnectionState::Closed => {
+                warn!(elapsed = ?started.elapsed(), "peer connection closed before it was established");
                 bail!("the connection was closed before it was established")
             }
-            Ok(_) | Err(_) => bail!("{FAILURE_HINT}"),
+            Ok(Ok(state)) => {
+                let state = *state;
+                warn!(elapsed = ?started.elapsed(), connection_state = %state, "peer connection failed during ICE/DTLS setup");
+                bail!("{FAILURE_HINT} Connection state: {state}.")
+            }
+            Ok(Err(_)) => {
+                warn!(elapsed = ?started.elapsed(), "peer connection state monitor stopped before connection");
+                bail!("{FAILURE_HINT}")
+            }
+            Err(_) => {
+                let state = *self.state.borrow();
+                warn!(
+                    elapsed = ?started.elapsed(),
+                    connection_state = %state,
+                    "timed out waiting for peer connection"
+                );
+                bail!("{FAILURE_HINT} Timed out in connection state {state}.")
+            }
         }
     }
 
@@ -349,6 +400,31 @@ fn trim_candidates(sdp: &str) -> String {
         trimmed.push_str(line);
     }
     trimmed
+}
+
+#[derive(Default)]
+struct CandidateCounts {
+    host: usize,
+    srflx: usize,
+    relay: usize,
+    other: usize,
+}
+
+impl CandidateCounts {
+    /// Counts candidate types without logging the IP addresses carried in SDP.
+    fn from_sdp(sdp: &str) -> Self {
+        let mut counts = Self::default();
+        for line in sdp.lines().filter(|line| line.starts_with("a=candidate:")) {
+            let kind = line.split_whitespace().nth(7).unwrap_or_default();
+            match kind {
+                "host" => counts.host += 1,
+                "srflx" => counts.srflx += 1,
+                "relay" => counts.relay += 1,
+                _ => counts.other += 1,
+            }
+        }
+        counts
+    }
 }
 
 fn ice_servers(ice: &IceConfig) -> Vec<RTCIceServer> {

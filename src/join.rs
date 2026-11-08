@@ -263,6 +263,7 @@ pub async fn run(
         reporter.report(Event::Reply { text: reply });
         reporter.report(Event::WaitingForHost);
 
+        debug!(timeout = ?CONNECT_TIMEOUT, "answer sent; waiting for the host's ICE checks and peer connection");
         peer.wait_connected(CONNECT_TIMEOUT).await?;
         let route = peer.log_selected_pair("host").await;
         let control = timeout(CONTROL_TIMEOUT, control_rx.recv())
